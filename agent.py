@@ -88,9 +88,22 @@ def process_user_input(query: str) -> str:
     Returns:
         str: Processed query for the agent
     """
-    # Remove common weather-related words to isolate potential city name
-    weather_words = ["weather", "temperature", "forecast", "climate", "in", "at", "of", "the"]
-    query_words = query.lower().split()
+    # Common weather-related words to ignore when looking for city names
+    weather_words = ["weather", "temperature", "forecast", "climate", "in", "at", "of", "the", 
+                    "wind", "speed", "humidity", "rain", "temperature", "how", "what", "is"]
+    
+    # Convert query to lowercase for better matching
+    query_lower = query.lower()
+    query_words = query_lower.split()
+    
+    # If asking about wind specifically
+    if "wind" in query_lower:
+        # Look for city name after removing weather-related words
+        potential_cities = [word for word in query_words if word not in weather_words]
+        for city in potential_cities:
+            if is_valid_city(city):
+                return f"get weather for {city}"
+        return query
     
     # Extract potential city name by removing weather-related words
     potential_cities = [word for word in query_words if word not in weather_words]
@@ -101,7 +114,7 @@ def process_user_input(query: str) -> str:
             return f"get weather for {city}"
             
     # If the original query contains weather words, return it as is
-    if any(word in query.lower() for word in weather_words):
+    if any(word in query_lower for word in weather_words):
         return query
         
     # If it's a single word, check if it's a city
@@ -132,18 +145,48 @@ def get_weather(location: str) -> str:
         response.raise_for_status()
         data = response.json()
         
+        # Extract all weather data
         temp = data["main"]["temp"]
         humidity = data["main"]["humidity"]
         description = data["weather"][0]["description"]
         city_name = data["name"]
         country = data["sys"]["country"]
         
+        # Extract wind data
+        wind_speed = data["wind"]["speed"]  # in meters/second
+        wind_speed_kmh = wind_speed * 3.6   # convert to km/h
+        wind_direction = data["wind"].get("deg", 0)  # wind direction in degrees
+        
+        # Get wind direction as compass point
+        def get_wind_direction(degrees):
+            directions = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                         "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+            index = round(degrees / (360 / len(directions))) % len(directions)
+            return directions[index]
+        
+        wind_compass = get_wind_direction(wind_direction)
+        
         # Calculate water intake recommendation
         recommended_intake, factors = calculate_water_intake(temp, humidity)
+        
+        # Add wind factor to water intake recommendation if wind speed is high
+        if wind_speed_kmh > 20:
+            recommended_intake *= 1.1  # Increase water intake by 10% in windy conditions
+            factors.append("High wind speed (+10% intake)")
+        
+        # Create wind description based on speed
+        wind_description = "Light breeze"
+        if wind_speed_kmh > 30:
+            wind_description = "Strong wind"
+        elif wind_speed_kmh > 20:
+            wind_description = "Moderate wind"
+        elif wind_speed_kmh > 10:
+            wind_description = "Gentle breeze"
         
         weather_info = (
             f"Current weather in {city_name}, {country}:\n"
             f"Temperature: {temp}°C\n"
+            f"Wind: {wind_description} at {wind_speed_kmh:.1f} km/h from {wind_compass}\n"
             f"Humidity: {humidity}%\n"
             f"Conditions: {description}\n\n"
             f"💧 Water Intake Recommendation 💧\n"
@@ -208,14 +251,21 @@ def get_weather_forecast(location_days: str) -> str:
             humidity = day["day"]["avghumidity"]
             condition = day["day"]["condition"]["text"]
             rain_chance = day["day"]["daily_chance_of_rain"]
+            max_wind_kph = day["day"]["maxwind_kph"]
             
             # Calculate water intake recommendation for average temperature
             recommended_intake, factors = calculate_water_intake(avg_temp_c, humidity)
+            
+            # Add wind factor if wind speed is high
+            if max_wind_kph > 20:
+                recommended_intake *= 1.1
+                factors.append("High wind speed (+10% intake)")
             
             forecast_info += (
                 f"Date: {date}\n"
                 f"Temperature: {min_temp_c}°C to {max_temp_c}°C (avg: {avg_temp_c}°C)\n"
                 f"Humidity: {humidity}%\n"
+                f"Max Wind Speed: {max_wind_kph} km/h\n"
                 f"Conditions: {condition}\n"
                 f"Chance of Rain: {rain_chance}%\n\n"
                 f"💧 Water Intake Recommendation 💧\n"
@@ -397,7 +447,7 @@ def create_agent():
     current_weather_tool = StructuredTool.from_function(
         func=get_weather,
         name="get_weather",
-        description="Get the current weather and water intake recommendation for a location. Input should be a city name (e.g., 'London' or 'New York')"
+        description="Get the current weather information including temperature, humidity, wind speed, and water intake recommendation for a location. Input should be a city name (e.g., 'London' or 'New York'). Use this for queries about weather conditions, wind speed, or temperature in a specific city."
     )
     
     forecast_tool = StructuredTool.from_function(
