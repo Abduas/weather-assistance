@@ -12,6 +12,7 @@ import json
 from mock_data import generate_mock_historical_weather
 from fuzzywuzzy import fuzz
 import re
+from datetime import datetime, timedelta
 
 # Load environment variables
 load_dotenv()
@@ -59,7 +60,7 @@ def calculate_water_intake(temp: float, humidity: float) -> tuple[float, list[st
     return recommended_intake, factors
 
 def is_valid_city(city: str) -> bool:
-    """Check if the input is a valid city name using OpenWeather API.
+    """Check if the input is a valid city name using OpenWeather API. Also if the spelling is incorrect, it should return the closest match.
     
     Args:
         city: Name of the city to validate
@@ -135,14 +136,46 @@ def get_closest_city_match(misspelled_city: str) -> tuple[str, int]:
     
     return (best_match, highest_score)
 
+def parse_date(date_str: str) -> datetime:
+    """Parse date from various formats.
+    
+    Args:
+        date_str: Date string in various formats (e.g., '24th may 2025', 'may 24 2025')
+    Returns:
+        datetime object
+    """
+    # Remove ordinal indicators (st, nd, rd, th)
+    date_str = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', date_str.lower())
+    
+    # Try different date formats
+    formats = [
+        '%d %B %Y',
+        '%B %d %Y',
+        '%d %b %Y',
+        '%b %d %Y',
+        '%Y-%m-%d',
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            continue
+    
+    raise ValueError(f"Could not parse date: {date_str}")
+
 def process_user_input(query: str) -> str:
-    """Process user input to handle spelling mistakes and identify city names.
+    """Process user input to handle spelling mistakes and identify city names and dates. Spelling mistakes should be recognized by the llm.
     
     Args:
         query: User input string
     Returns:
         str: Processed query for the agent
     """
+    # Define stop words at the beginning of the function
+    stop_words = {"in", "at", "of", "the", "is", "what", "how", "tell", "me", "about", "get", "show", 
+                 "was", "on", "before", "ago", "last", "week", "weeks", "day", "days", "month", "months"}
+    
     # Common weather-related words and their correct spellings
     weather_words = {
         "weather": ["weather", "wether", "wheather", "whether", "wethr"],
@@ -160,11 +193,50 @@ def process_user_input(query: str) -> str:
     corrected_words = []
     has_weather_term = False
     
+    # Try to extract date from the query
+    date_pattern = r'(\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4})'
+    date_matches = re.findall(date_pattern, query_lower)
+    
+    if date_matches:
+        try:
+            query_date = parse_date(date_matches[0])
+            current_date = datetime.now()
+            
+            # If the date is within 14 days in the future, use forecast
+            if query_date > current_date and (query_date - current_date).days <= 14:
+                days_ahead = (query_date - current_date).days
+                # Process rest of the query for city name
+                query_without_date = query_lower.replace(date_matches[0], '').strip()
+                # Extract city and process for weather forecast
+                for word in query_without_date.split():
+                    if word not in stop_words and not any(word in vars for vars in weather_words.values()):
+                        closest_city, confidence = get_closest_city_match(word)
+                        if confidence > 70:
+                            return f"get weather forecast for {closest_city}:{days_ahead}"
+            
+            # If the date is in the past, use historical weather
+            elif query_date < current_date:
+                # Process rest of the query for city name
+                query_without_date = query_lower.replace(date_matches[0], '').strip()
+                # Extract city and process for historical weather
+                for word in query_without_date.split():
+                    if word not in stop_words and not any(word in vars for vars in weather_words.values()):
+                        closest_city, confidence = get_closest_city_match(word)
+                        if confidence > 70:
+                            return f"get historical weather for {closest_city}:{query_date.strftime('%Y-%m-%d')}"
+            
+            # If the date is too far in the future
+            else:
+                return f"The date {query_date.strftime('%d %B %Y')} is too far in the future. I can only provide forecasts for the next 14 days."
+                
+        except ValueError:
+            pass
+    
+    # Continue with the existing word correction logic
     for word in words:
         corrected = word
         # Check if it's a weather-related word with spelling mistake
         for correct_word, variations in weather_words.items():
-            # Use fuzzy matching to find closest weather word
             if any(fuzz.ratio(word, var) > 75 for var in variations):
                 corrected = correct_word
                 has_weather_term = True
@@ -174,16 +246,14 @@ def process_user_input(query: str) -> str:
     # Join words back together
     corrected_query = " ".join(corrected_words)
     
-    # Look for potential city names (words not in weather words or common stop words)
-    stop_words = {"in", "at", "of", "the", "is", "what", "how", "tell", "me", "about", "get", "show", "was", "on", "before", "ago", "last", "week", "weeks", "day", "days", "month", "months"}
+    # Look for potential city names
     potential_cities = [word for word in corrected_words if word not in stop_words and 
                        not any(word in vars for vars in weather_words.values())]
     
     # Try to find the closest matching city
     for city in potential_cities:
         closest_city, confidence = get_closest_city_match(city)
-        if confidence > 70:  # Only use matches with high confidence
-            # Replace the misspelled city with the correct one
+        if confidence > 70:
             corrected_query = corrected_query.replace(city, closest_city)
             if city != closest_city:
                 if has_weather_term:
@@ -219,17 +289,33 @@ def get_weather(location: str) -> str:
         response.raise_for_status()
         data = response.json()
         
+        # Validate required fields
+        required_fields = {
+            "main": ["temp", "humidity"],  # Only require essential fields
+            "name": None
+        }
+        
+        for field, subfields in required_fields.items():
+            if field not in data:
+                return f"Error: Missing {field} data from API response"
+            if subfields:
+                for subfield in subfields:
+                    if subfield not in data[field]:
+                        return f"Error: Missing {field}.{subfield} data from API response"
+        
         # Extract all weather data
         temp = data["main"]["temp"]
         humidity = data["main"]["humidity"]
-        description = data["weather"][0]["description"]
+        feels_like = data["main"].get("feels_like", temp)  # Default to temp if feels_like missing
+        pressure = data["main"].get("pressure", "N/A")
+        description = data["weather"][0]["description"] if "weather" in data and data["weather"] else "No description available"
         city_name = data["name"]
-        country = data["sys"]["country"]
+        country = data["sys"]["country"] if "sys" in data and "country" in data["sys"] else ""
         
-        # Extract wind data
-        wind_speed = data["wind"]["speed"]  # in meters/second
+        # Extract wind data with defaults
+        wind_speed = data.get("wind", {}).get("speed", 0)  # Default to 0 if missing
         wind_speed_kmh = wind_speed * 3.6   # convert to km/h
-        wind_direction = data["wind"].get("deg", 0)  # wind direction in degrees
+        wind_direction = data.get("wind", {}).get("deg", 0)  # Default to 0 if missing
         
         # Get wind direction as compass point
         def get_wind_direction(degrees):
@@ -257,16 +343,30 @@ def get_weather(location: str) -> str:
         elif wind_speed_kmh > 10:
             wind_description = "Gentle breeze"
         
+        # Get current timestamp in local time
+        local_time = datetime.fromtimestamp(data["dt"]).strftime("%Y-%m-%d %H:%M:%S")
+        
         weather_info = (
-            f"Current weather in {city_name}, {country}:\n"
-            f"Temperature: {temp}°C\n"
+            f"Current weather in {city_name}, {country} (as of {local_time}):\n"
+            f"Temperature: {temp}°C (Feels like: {feels_like}°C)\n"
             f"Wind: {wind_description} at {wind_speed_kmh:.1f} km/h from {wind_compass}\n"
             f"Humidity: {humidity}%\n"
-            f"Conditions: {description}\n\n"
-            f"💧 Water Intake Recommendation 💧\n"
-            f"Recommended water intake: {recommended_intake:.1f} liters\n\n"
-            f"Factors affecting recommendation:\n"
+            f"Pressure: {pressure} hPa\n"
+            f"Conditions: {description}\n"
         )
+        
+        # Add extra weather data if available
+        if "rain" in data and "1h" in data["rain"]:
+            weather_info += f"Rainfall (last hour): {data['rain']['1h']} mm\n"
+        if "clouds" in data and "all" in data["clouds"]:
+            weather_info += f"Cloud cover: {data['clouds']['all']}%\n"
+        if "visibility" in data:
+            visibility_km = data["visibility"] / 1000
+            weather_info += f"Visibility: {visibility_km:.1f} km\n"
+            
+        weather_info += f"\n💧 Water Intake Recommendation 💧\n"
+        weather_info += f"Recommended water intake: {recommended_intake:.1f} liters\n\n"
+        weather_info += f"Factors affecting recommendation:\n"
         
         # Add factors to the output
         for factor in factors:
@@ -278,6 +378,10 @@ def get_weather(location: str) -> str:
     
     except requests.exceptions.RequestException as e:
         return f"Error fetching weather data: {str(e)}"
+    except (KeyError, ValueError) as e:
+        return f"Error processing weather data: {str(e)}"
+    except Exception as e:
+        return f"Unexpected error: {str(e)}"
 
 def get_weather_forecast(location_days: str) -> str:
     """Get the weather forecast and water intake recommendations for a given location and number of days.
@@ -291,8 +395,8 @@ def get_weather_forecast(location_days: str) -> str:
     location = parts[0]
     days = int(parts[1]) if len(parts) > 1 else 3
     
-    # Limit forecast days to 3 for free tier
-    days = min(days, 3)
+    # Limit forecast days to 14 for free tier and future forecasts
+    days = min(days, 14)
     
     api_key = os.getenv("WEATHERAPI_KEY")
     if not api_key:
@@ -318,7 +422,7 @@ def get_weather_forecast(location_days: str) -> str:
         forecast_info = f"Weather forecast for {location_name}, {country}:\n\n"
         
         for day in forecast_days:
-            date = day["date"]
+            date = datetime.strptime(day["date"], "%Y-%m-%d").strftime("%d %B %Y")
             max_temp_c = day["day"]["maxtemp_c"]
             min_temp_c = day["day"]["mintemp_c"]
             avg_temp_c = day["day"]["avgtemp_c"]
