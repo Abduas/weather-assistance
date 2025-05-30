@@ -165,7 +165,7 @@ def parse_date(date_str: str) -> datetime:
     raise ValueError(f"Could not parse date: {date_str}")
 
 def process_user_input(query: str) -> str:
-    """Process user input to handle spelling mistakes and identify city names and dates. Spelling mistakes should be recognized by the llm.
+    """Process user input to handle spelling mistakes and identify city names and dates.
     
     Args:
         query: User input string
@@ -175,6 +175,30 @@ def process_user_input(query: str) -> str:
     # Define stop words at the beginning of the function
     stop_words = {"in", "at", "of", "the", "is", "what", "how", "tell", "me", "about", "get", "show", 
                  "was", "on", "before", "ago", "last", "week", "weeks", "day", "days", "month", "months"}
+    
+    # Handle relative date references
+    query_lower = query.lower()
+    current_date = datetime.now()
+    
+    # Initialize corrected words list and weather term flag
+    corrected_words = []
+    has_weather_term = False
+    
+    # Handle "yesterday"
+    if "yesterday" in query_lower:
+        yesterday = current_date - timedelta(days=1)
+        # Replace "yesterday" with the actual date
+        query_lower = query_lower.replace("yesterday", yesterday.strftime("%d %B %Y"))
+    
+    # Handle "last week"
+    elif "last week" in query_lower:
+        last_week = current_date - timedelta(days=7)
+        query_lower = query_lower.replace("last week", last_week.strftime("%d %B %Y"))
+    
+    # Handle "last month"
+    elif "last month" in query_lower:
+        last_month = current_date - timedelta(days=30)
+        query_lower = query_lower.replace("last month", last_month.strftime("%d %B %Y"))
     
     # Common weather-related words and their correct spellings
     weather_words = {
@@ -186,12 +210,6 @@ def process_user_input(query: str) -> str:
         "rain": ["rain", "rane", "reign"],
         "cloudy": ["cloudy", "cloudi", "claudy"]
     }
-    
-    # Convert query to lowercase for better matching
-    query_lower = query.lower()
-    words = query_lower.split()
-    corrected_words = []
-    has_weather_term = False
     
     # Try to extract date from the query
     date_pattern = r'(\d{1,2}(?:st|nd|rd|th)?\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{4})'
@@ -233,13 +251,12 @@ def process_user_input(query: str) -> str:
             pass
     
     # Continue with the existing word correction logic
-    for word in words:
+    for word in query_lower.split():
         corrected = word
         # Check if it's a weather-related word with spelling mistake
         for correct_word, variations in weather_words.items():
             if any(fuzz.ratio(word, var) > 75 for var in variations):
                 corrected = correct_word
-                has_weather_term = True
                 break
         corrected_words.append(corrected)
     
@@ -256,13 +273,10 @@ def process_user_input(query: str) -> str:
         if confidence > 70:
             corrected_query = corrected_query.replace(city, closest_city)
             if city != closest_city:
-                if has_weather_term:
-                    return f"Note: Assuming you meant '{closest_city}' instead of '{city}'.\n{corrected_query}"
-                else:
-                    return f"Note: Assuming you meant '{closest_city}' instead of '{city}'.\nget weather for {closest_city}"
+                return f"Note: Assuming you meant '{closest_city}' instead of '{city}'.\n{corrected_query}"
     
     # If we found a city but no weather term, add "get weather for"
-    if potential_cities and not has_weather_term:
+    if potential_cities:
         return f"get weather for {corrected_query}"
     
     return corrected_query
