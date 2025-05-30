@@ -10,6 +10,8 @@ from langchain.agents.output_parsers import ReActSingleInputOutputParser
 from langchain.schema import AgentAction, AgentFinish
 import json
 from mock_data import generate_mock_historical_weather
+from fuzzywuzzy import fuzz
+import re
 
 # Load environment variables
 load_dotenv()
@@ -81,48 +83,119 @@ def is_valid_city(city: str) -> bool:
     except:
         return False
 
+def get_closest_city_match(misspelled_city: str) -> tuple[str, int]:
+    """Find the closest matching city using the OpenWeather API and fuzzy matching.
+    
+    Args:
+        misspelled_city: Potentially misspelled city name
+    Returns:
+        tuple: (closest_match, confidence_score)
+    """
+    api_key = os.getenv("OPENWEATHER_API_KEY")
+    if not api_key:
+        return (misspelled_city, 0)
+    
+    # Try exact match first
+    if is_valid_city(misspelled_city):
+        return (misspelled_city, 100)
+    
+    # List of common city variations to try
+    variations = [
+        misspelled_city,
+        misspelled_city.capitalize(),
+        misspelled_city.lower(),
+        misspelled_city.upper(),
+        # Remove repeated letters (e.g., kasaragodd -> kasaragod)
+        re.sub(r'(.)\1+', r'\1', misspelled_city)
+    ]
+    
+    highest_score = 0
+    best_match = misspelled_city
+    
+    for variation in variations:
+        try:
+            base_url = "https://api.openweathermap.org/data/2.5/weather"
+            params = {
+                "q": variation,
+                "appid": api_key,
+                "units": "metric"
+            }
+            response = requests.get(base_url, params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                city_name = data["name"]
+                # Calculate similarity score
+                score = fuzz.ratio(misspelled_city.lower(), city_name.lower())
+                if score > highest_score:
+                    highest_score = score
+                    best_match = city_name
+        except:
+            continue
+    
+    return (best_match, highest_score)
+
 def process_user_input(query: str) -> str:
-    """Process user input to determine if it's a city name or weather-related query.
+    """Process user input to handle spelling mistakes and identify city names.
     
     Args:
         query: User input string
     Returns:
         str: Processed query for the agent
     """
-    # Common weather-related words to ignore when looking for city names
-    weather_words = ["weather", "temperature", "forecast", "climate", "in", "at", "of", "the", 
-                    "wind", "speed", "humidity", "rain", "temperature", "how", "what", "is"]
+    # Common weather-related words and their correct spellings
+    weather_words = {
+        "weather": ["weather", "wether", "wheather", "whether", "wethr"],
+        "temperature": ["temperature", "temp", "temprature", "tempreture"],
+        "forecast": ["forecast", "forcast", "fourcast", "forcaste"],
+        "humidity": ["humidity", "humidty", "huminity"],
+        "wind": ["wind", "wnd", "vind"],
+        "rain": ["rain", "rane", "reign"],
+        "cloudy": ["cloudy", "cloudi", "claudy"]
+    }
     
     # Convert query to lowercase for better matching
     query_lower = query.lower()
-    query_words = query_lower.split()
+    words = query_lower.split()
+    corrected_words = []
+    has_weather_term = False
     
-    # If asking about wind specifically
-    if "wind" in query_lower:
-        # Look for city name after removing weather-related words
-        potential_cities = [word for word in query_words if word not in weather_words]
-        for city in potential_cities:
-            if is_valid_city(city):
-                return f"get weather for {city}"
-        return query
+    for word in words:
+        corrected = word
+        # Check if it's a weather-related word with spelling mistake
+        for correct_word, variations in weather_words.items():
+            # Use fuzzy matching to find closest weather word
+            if any(fuzz.ratio(word, var) > 75 for var in variations):
+                corrected = correct_word
+                has_weather_term = True
+                break
+        corrected_words.append(corrected)
     
-    # Extract potential city name by removing weather-related words
-    potential_cities = [word for word in query_words if word not in weather_words]
+    # Join words back together
+    corrected_query = " ".join(corrected_words)
     
-    # If we have potential cities, check if any are valid
+    # Look for potential city names (words not in weather words or common stop words)
+    stop_words = {"in", "at", "of", "the", "is", "what", "how", "tell", "me", "about", "get", "show", "was", "on", "before", "ago", "last", "week", "weeks", "day", "days", "month", "months"}
+    potential_cities = [word for word in corrected_words if word not in stop_words and 
+                       not any(word in vars for vars in weather_words.values())]
+    
+    # Try to find the closest matching city
     for city in potential_cities:
-        if is_valid_city(city):
-            return f"get weather for {city}"
-            
-    # If the original query contains weather words, return it as is
-    if any(word in query_lower for word in weather_words):
-        return query
-        
-    # If it's a single word, check if it's a city
-    if len(query_words) == 1 and is_valid_city(query):
-        return f"get weather for {query}"
+        closest_city, confidence = get_closest_city_match(city)
+        if confidence > 70:  # Only use matches with high confidence
+            # Replace the misspelled city with the correct one
+            corrected_query = corrected_query.replace(city, closest_city)
+            if city != closest_city:
+                if has_weather_term:
+                    return f"Note: Assuming you meant '{closest_city}' instead of '{city}'.\n{corrected_query}"
+                else:
+                    return f"Note: Assuming you meant '{closest_city}' instead of '{city}'.\nget weather for {closest_city}"
     
-    return query
+    # If we found a city but no weather term, add "get weather for"
+    if potential_cities and not has_weather_term:
+        return f"get weather for {corrected_query}"
+    
+    return corrected_query
 
 def get_weather(location: str) -> str:
     """Get the current weather and water intake recommendation for a given location.
@@ -516,16 +589,31 @@ def main():
             print("Goodbye!")
             break
         
-        # Process the user input
-        processed_input = process_user_input(user_input)
-        
         try:
-            # If it's a valid city, get the weather directly
-            if is_valid_city(user_input):
-                response = get_weather(user_input)
-                print("\nAssistant:", response)
+            # Process the user input and handle spelling mistakes
+            processed_input = process_user_input(user_input)
+            
+            # Check if there's a spelling correction note
+            if processed_input.startswith("Note: "):
+                correction_note, actual_query = processed_input.split("\n")
+                print("\nAssistant:", correction_note)
+                processed_input = actual_query
+            
+            # Extract the city name from the processed input
+            words = processed_input.split()
+            city_index = -1
+            if "for" in words:
+                city_index = words.index("for") + 1
+            
+            if city_index >= 0 and city_index < len(words):
+                city = words[city_index]
+                if is_valid_city(city):
+                    response = get_weather(city)
+                    print("\nAssistant:", response)
+                else:
+                    response = agent.invoke({"input": processed_input})
+                    print("\nAssistant:", response["output"])
             else:
-                # Otherwise, let the agent handle the query
                 response = agent.invoke({"input": processed_input})
                 print("\nAssistant:", response["output"])
                 
