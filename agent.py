@@ -9,6 +9,7 @@ from typing import Optional
 from langchain.agents.output_parsers import ReActSingleInputOutputParser
 from langchain.schema import AgentAction, AgentFinish
 import json
+from mock_data import generate_mock_historical_weather
 
 # Load environment variables
 load_dotenv()
@@ -299,22 +300,30 @@ def get_historical_weather(location_date: str) -> str:
     location = parts[0]
     date = parts[1]
     
-    api_key = os.getenv("WEATHERAPI_KEY")
-    if not api_key:
-        return "Error: WeatherAPI key not found in environment variables"
-    
-    base_url = "http://api.weatherapi.com/v1/history.json"
-    params = {
-        "q": location,
-        "key": api_key,
-        "dt": date,
-        "aqi": "no"
-    }
-    
     try:
-        response = requests.get(base_url, params=params)
-        response.raise_for_status()
-        data = response.json()
+        # Check if we should use mock data from environment variable
+        use_mock = os.getenv("USE_MOCK_WEATHER", "true").lower() == "true"
+        
+        if use_mock:
+            # Use mock data for development/testing
+            data = generate_mock_historical_weather(location.split(',')[0], date)
+        else:
+            # Use real API for production
+            api_key = os.getenv("WEATHERAPI_KEY")
+            if not api_key:
+                return "Error: WeatherAPI key not found in environment variables"
+            
+            base_url = "http://api.weatherapi.com/v1/history.json"
+            params = {
+                "q": location,
+                "key": api_key,
+                "dt": date,
+                "aqi": "no"
+            }
+            
+            response = requests.get(base_url, params=params)
+            response.raise_for_status()
+            data = response.json()
         
         location_name = data["location"]["name"]
         country = data["location"]["country"]
@@ -330,20 +339,31 @@ def get_historical_weather(location_date: str) -> str:
         max_wind_kph = day_data["maxwind_kph"]
         humidity = day_data["avghumidity"]
         
+        # Calculate water intake recommendation
+        recommended_intake, factors = calculate_water_intake(avg_temp_c, humidity)
+        
         historical_info = (
             f"Historical weather for {location_name}, {country} on {date}:\n\n"
-            f"Maximum Temperature: {max_temp_c}°C\n"
-            f"Minimum Temperature: {min_temp_c}°C\n"
+            f"Temperature Range: {min_temp_c}°C to {max_temp_c}°C\n"
             f"Average Temperature: {avg_temp_c}°C\n"
-            f"Conditions: {condition}\n"
-            f"Total Precipitation: {total_precip_mm}mm\n"
             f"Maximum Wind Speed: {max_wind_kph} km/h\n"
-            f"Average Humidity: {humidity}%\n"
+            f"Humidity: {humidity}%\n"
+            f"Conditions: {condition}\n"
+            f"Total Precipitation: {total_precip_mm}mm\n\n"
+            f"💧 Water Intake Recommendation 💧\n"
+            f"Recommended water intake: {recommended_intake:.1f} liters\n\n"
+            f"Factors affecting recommendation:\n"
         )
+        
+        # Add factors to the output
+        for factor in factors:
+            historical_info += f"- {factor}\n"
+            
+        historical_info += "\nNote: Historical data is simulated for development purposes." if use_mock else ""
         
         return historical_info
     
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         return f"Error fetching historical weather data: {str(e)}"
 
 def get_water_recommendation(city: str) -> str:
@@ -459,7 +479,7 @@ def create_agent():
     historical_tool = StructuredTool.from_function(
         func=get_historical_weather,
         name="get_historical_weather",
-        description="Get historical weather data for a location. Input should be a city name with country code and date in format 'city,country:YYYY-MM-DD' (e.g., 'London,UK:2024-01-01')"
+        description="Get historical weather data for a location and date. Input must be in format 'city,country:YYYY-MM-DD' (e.g., 'London,UK:2024-01-15')"
     )
     
     water_recommendation_tool = StructuredTool.from_function(
@@ -514,4 +534,5 @@ def main():
             continue
 
 if __name__ == "__main__":
-    main() 
+    main()
+
